@@ -3,21 +3,28 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net/http"
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/gocolly/colly"
+	"golang.org/x/net/html"
 )
 
-var lock = sync.RWMutex{}
+var allowedDomain string
+var alreadyVisitedUrls = map[string]bool{}
+var errorsList = make([]string, 0)
+var lock = sync.RWMutex{} // Lock mechanism used to work with concurrent map read and writes.
 var staticFilesList = map[string][]string{}
 var urlsList = make([]string, 0)
 var urlsListIndex = map[string]int{}
-var urlsLinksTo = map[int]map[int]bool{}
+var urlsLinksTo = map[int]map[int]bool{} //
+var waitGroup sync.WaitGroup
 
 type UrlObject struct {
 	Id          int
@@ -51,6 +58,77 @@ func addStaticFile(currentUrl string, staticFileUrl string) {
 	staticFilesList[currentUrl] = append(staticFilesList[currentUrl], staticFileUrl)
 }
 
+func checkForCSSReference(parentUrl string, token html.Token) {
+	isStylesheet := false
+	stylesheet := ""
+	breakLoop := false
+	for _, attribute := range token.Attr {
+		switch attribute.Key {
+		case "href":
+			stylesheet = getProcessedUrl(parentUrl, attribute.Val)
+			if attribute.Val != "" {
+				addStaticFile(parentUrl, getProcessedUrl(parentUrl, attribute.Val))
+			}
+			break
+		case "rel":
+			if attribute.Val == "stylesheet" {
+				isStylesheet = true
+				break
+			}
+			breakLoop = true
+			break
+		default:
+			break
+		}
+		if isStylesheet && stylesheet != "" {
+			addStaticFile(parentUrl, stylesheet)
+			break
+		}
+		if breakLoop {
+			break
+		}
+	}
+}
+
+func checkForImageReference(parentUrl string, token html.Token) {
+	for _, attribute := range token.Attr {
+		if attribute.Key == "src" {
+			addStaticFile(parentUrl, getProcessedUrl(parentUrl, attribute.Val))
+			break
+		}
+	}
+}
+
+func checkForJavaScriptReference(parentUrl string, token html.Token) {
+	for _, attribute := range token.Attr {
+		if attribute.Key == "src" && attribute.Val != "" {
+			addStaticFile(parentUrl, getProcessedUrl(parentUrl, attribute.Val))
+			break
+		}
+	}
+}
+
+func checkForUrlReference(parentUrl string, token html.Token) {
+	for _, attribute := range token.Attr {
+		if attribute.Key == "href" {
+			link := getProcessedUrl(parentUrl, attribute.Val)
+			waitGroup.Add(1)
+			go func() {
+				visited := visitPage(link)
+				if visited {
+					callerUrlIndex := addOrGetIndexForUrl(parentUrl)
+					currentUrlIndex := addOrGetIndexForUrl(link)
+					lock.Lock()
+					defer lock.Unlock()
+					urlsLinksTo[callerUrlIndex][currentUrlIndex] = true
+				}
+				waitGroup.Done()
+			}()
+			break
+		}
+	}
+}
+
 func createSliceFromMapKeys(data map[int]bool) []int {
 	slice := make([]int, 0)
 	for key := range data {
@@ -62,6 +140,7 @@ func createSliceFromMapKeys(data map[int]bool) []int {
 
 func main() {
 	args := os.Args
+	// TODO: remove IDEA run hack.
 	if len(args) != 2 && len(args) != 3 {
 		fmt.Println("invalid args")
 		return
@@ -75,82 +154,25 @@ func main() {
 	inputUrl := args[0]
 	outputFilename := args[1]
 
-	collector := colly.NewCollector(
-		colly.Async(true),
-	)
-
 	parsedUrl, err := url.Parse(inputUrl)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	collector.AllowedDomains = []string{parsedUrl.Hostname()}
+	allowedDomain = parsedUrl.Hostname()
 
-	collector.OnHTML("a", func(htmlElement *colly.HTMLElement) {
-		link := removeTrailingSlash(htmlElement.Request.AbsoluteURL(htmlElement.Attr("href")))
-		err := htmlElement.Request.Visit(link)
-		switch err {
-		case colly.ErrForbiddenDomain, colly.ErrMissingURL:
-			break
-		case colly.ErrAlreadyVisited, nil:
-			linkParsedUrl, err := url.Parse(link)
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-			if linkParsedUrl.Hostname() == parsedUrl.Hostname() {
-				callerUrlIndex := addOrGetIndexForUrl(htmlElement.Request.AbsoluteURL(htmlElement.Request.URL.String()))
-				currentUrlIndex := addOrGetIndexForUrl(link)
-				lock.Lock()
-				defer lock.Unlock()
-				urlsLinksTo[callerUrlIndex][currentUrlIndex] = true
-			}
-			break
-		default:
-			fmt.Println("Request URL:", htmlElement.Attr("href"), "failed with error:", err)
-			break
-		}
-	})
+	waitGroup.Add(1)
+	go func() {
+		visitPage(inputUrl)
+		waitGroup.Done()
+	}()
 
-	// Image references.
-	collector.OnHTML("img", func(htmlElement *colly.HTMLElement) {
-		addStaticFile(htmlElement.Request.URL.String(), htmlElement.Request.AbsoluteURL(htmlElement.Attr("src")))
-	})
+	waitGroup.Wait()
 
-	// CSS references.
-	collector.OnHTML("link", func(htmlElement *colly.HTMLElement) {
-		if htmlElement.Attr("rel") == "stylesheet" {
-			addStaticFile(htmlElement.Request.URL.String(), htmlElement.Request.AbsoluteURL(htmlElement.Attr("href")))
-		}
-	})
-
-	// JavaScript references.
-	collector.OnHTML("script", func(htmlElement *colly.HTMLElement) {
-		src := htmlElement.Attr("src")
-		if src != "" {
-			addStaticFile(htmlElement.Request.URL.String(), htmlElement.Request.AbsoluteURL(htmlElement.Attr("src")))
-		}
-	})
-
-	collector.OnResponse(func(response *colly.Response) {
-		if strings.Index(response.Headers.Get("Content-Type"), "html") > -1 {
-			fmt.Println("Visiting", response.Request.AbsoluteURL(response.Request.URL.String()))
-			addOrGetIndexForUrl(response.Request.AbsoluteURL(response.Request.URL.String()))
-		}
-	})
-
-	collector.OnError(func(response *colly.Response, err error) {
-		fmt.Println("Request URL:", response.Request.URL, "failed with error:", err)
-	})
-
-	err = collector.Visit(inputUrl)
-	if err != nil {
-		fmt.Println(err)
-		return
+	for _, singleError := range errorsList {
+		fmt.Println(singleError)
 	}
-
-	collector.Wait()
 
 	var jsonData []UrlObject
 	for _, urlString := range urlsList {
@@ -176,6 +198,116 @@ func main() {
 	}
 }
 
+func getProcessedUrl(parentUrl string, rawUrl string) string {
+	if strings.HasPrefix(rawUrl, "#") {
+		return ""
+	}
+	if parentUrl != "" {
+		relativeUrl, err := url.Parse(rawUrl)
+		if err != nil {
+			errorsList = append(errorsList, "Relative URL: "+rawUrl+" parsing failed with error:"+err.Error())
+			return ""
+		}
+		baseUrl, err := url.Parse(parentUrl)
+		if err != nil {
+			errorsList = append(errorsList, "Base URL: "+parentUrl+" parsing failed with error:"+err.Error())
+			return ""
+		}
+		return removeTrailingSlash(baseUrl.ResolveReference(relativeUrl).String())
+	}
+	return removeTrailingSlash(rawUrl)
+}
+
+func getUrlWithoutProtocol(urlWithProtocol string) string {
+	parsedUrl, err := url.Parse(urlWithProtocol)
+	if err != nil {
+		errorsList = append(errorsList, "URL: "+urlWithProtocol+" parsing failed with error:"+err.Error())
+		return ""
+	}
+	urlWithoutProtocol := strings.TrimLeft(parsedUrl.String(), parsedUrl.Scheme)
+	return urlWithoutProtocol
+}
+
+func parseHtml(parentUrl string, pageDataReader io.ReadCloser) {
+	htmlTokens := html.NewTokenizer(pageDataReader)
+	breakLoop := false
+	for {
+		tokenType := htmlTokens.Next()
+		switch tokenType {
+		case html.ErrorToken:
+			breakLoop = true // Finish parsing at document end.
+			break
+		case html.SelfClosingTagToken, html.StartTagToken:
+			token := htmlTokens.Token()
+			switch token.Data {
+			case "a":
+				checkForUrlReference(parentUrl, token)
+				break
+			case "img":
+				checkForImageReference(parentUrl, token)
+				break
+			case "link":
+				checkForCSSReference(parentUrl, token)
+				break
+			case "script":
+				checkForJavaScriptReference(parentUrl, token)
+				break
+			default:
+				break
+			}
+		}
+		if breakLoop {
+			break
+		}
+	}
+}
+
 func removeTrailingSlash(data string) string {
 	return strings.TrimRight(data, "/")
+}
+
+func visitPage(pageUrl string) bool {
+	processedUrl := getProcessedUrl("", pageUrl)
+	urlWithoutProtocol := getUrlWithoutProtocol(processedUrl)
+	lock.Lock()
+	if _, ok := alreadyVisitedUrls[urlWithoutProtocol]; !ok { // Check for the URl without the protocol (http:// or https://) to visit the URL just once.
+		alreadyVisitedUrls[urlWithoutProtocol] = true
+		lock.Unlock()
+		parsedUrl, err := url.Parse(pageUrl)
+		if err != nil {
+			fmt.Println(err)
+			return false
+		}
+		if parsedUrl.Hostname() == allowedDomain {
+			headResponse, err := http.Head(processedUrl)
+			if err != nil {
+				errorsList = append(errorsList, "Request URL (HEAD): "+headResponse.Request.URL.String()+" failed with error:"+err.Error())
+				return false
+			}
+			if strings.Index(headResponse.Header.Get("Content-Type"), "html") > -1 {
+				getResponse, err := http.Get(processedUrl)
+				if err != nil {
+					errorsList = append(errorsList, "Request URL (GET): "+getResponse.Request.URL.String()+" failed with error:"+err.Error())
+					return false
+				}
+				defer getResponse.Body.Close()
+				if getResponse.StatusCode != 200 {
+					errorsList = append(errorsList, "Request URL (GET): "+getResponse.Request.URL.String()+" failed with status code:"+strconv.Itoa(getResponse.StatusCode))
+					return false
+				}
+				fmt.Println("Visiting", processedUrl)
+				addOrGetIndexForUrl(processedUrl)
+				parseHtml(processedUrl, getResponse.Body)
+				return true
+			}
+			return false
+		}
+		return false
+	}
+	if _, ok := urlsListIndex[processedUrl]; ok {
+		lock.Unlock()
+		return true
+	}
+	lock.Unlock()
+	return false
 }

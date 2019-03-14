@@ -2,7 +2,13 @@
 
 Install [Go](https://golang.org).
 
-Then run (it will download the dependencies on the first time you run it):
+Install the dependency running:
+
+ ```sh
+ go get -u golang.org/x/net/html
+ ```
+
+Then run:
 
 ```sh
 go run main.go https://elixir-lang.org test.json
