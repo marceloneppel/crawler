@@ -140,19 +140,13 @@ func createSliceFromMapKeys(data map[int]bool) []int {
 
 func main() {
 	args := os.Args
-	// TODO: remove IDEA run hack.
-	if len(args) != 2 && len(args) != 3 {
+	if len(args) != 3 {
 		fmt.Println("invalid args")
 		return
 	}
 
-	// IDEA run hack.
-	if len(args) == 3 {
-		args = args[1:3]
-	}
-
-	inputUrl := args[0]
-	outputFilename := args[1]
+	inputUrl := args[1]
+	outputFilename := args[2]
 
 	parsedUrl, err := url.Parse(inputUrl)
 	if err != nil {
